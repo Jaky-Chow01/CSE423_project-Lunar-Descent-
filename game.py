@@ -523,7 +523,7 @@ def mouse_click(button, state, x, y):
             for i in range(3):
                 if 400 <= x <= 600 and (500 - (i*100) - 10) <= ly <= (500 - (i*100) + 25):
                     selected_rocket_index, current_state = i, "ROCKET_VIEWER"
-            
+            ````````````````
             # Start Mission button
             if 400 <= x <= 600 and 190 <= ly <= 215:
                 if not rocket_selected:
