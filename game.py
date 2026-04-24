@@ -9,7 +9,7 @@ import os
 current_state = "MENU" 
 selected_option = -1 
 selected_rocket_index = 0
-selected_rocket_for_game = 0  # Rocket selected for gameplay
+selected_rocket_for_game = -1  # Rocket selected for gameplay (-1 = none selected)
 rocket_selected = False  # Flag to check if a rocket was selected for game
 show_alert = False  # Alert message flag
 alert_message = ""  # Alert message text
@@ -155,7 +155,7 @@ def draw_eva_nation():
     glPushMatrix()
     glTranslatef(0.0, 3.20, 0.0)
     draw_sphere_new(0.08)
-    glPopMatrix()
+    glPopMatrix() 
 
     # Bottom cap
     glColor3f(0.85, 0.45, 0.70)
@@ -519,11 +519,11 @@ def mouse_click(button, state, x, y):
         last_click_x, last_click_y = x, y
         ly = 800 - y 
 
-        if current_state == "ROCKET_LIST":
+        if current_state == "ROCKET_LIST": 
             for i in range(3):
                 if 400 <= x <= 600 and (500 - (i*100) - 10) <= ly <= (500 - (i*100) + 25):
                     selected_rocket_index, current_state = i, "ROCKET_VIEWER"
-            ````````````````
+            
             # Start Mission button
             if 400 <= x <= 600 and 190 <= ly <= 215:
                 if not rocket_selected:
@@ -546,7 +546,7 @@ def mouse_click(button, state, x, y):
                 if 400 <= x <= 600 and (500-(i*90)-10) <= ly <= (500-(i*90)+25):
                     if selected_option == i:
                         if current_state == "MENU":
-                            if i == 0: current_state = "GAMEPLAY"
+                            if i == 0: current_state = "ROCKET_LIST"; selected_option = selected_rocket_for_game
                             elif i == 1: current_state = "OPTIONS"; selected_option = -1
                             elif i == 2: os._exit(0)
                         elif current_state == "OPTIONS":
@@ -629,10 +629,10 @@ def main():
     glutIdleFunc(idle)
     glutMouseFunc(mouse_click)
     
-    # --- ADD THIS LINE BELOW ---
+
     glutKeyboardFunc(keyboard) 
-    # ---------------------------
+
     
-    glutSpecialFunc(special_keys) # This is for your arrows
+    glutSpecialFunc(special_keys) 
     glutMainLoop()
 if __name__ == "__main__": main()
