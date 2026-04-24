@@ -1,4 +1,5 @@
 from OpenGL.GL import *
+from OpenGL.GLU import *
 from OpenGL.GLUT import *
 import math, random, os as _os
 
@@ -8,7 +9,7 @@ WIN_W, WIN_H = 1000, 800
 #  GLOBAL STATE
 # ═══════════════════════════════════════════════════════════════════════════
 current_state            = "MENU"
-selected_option          = -1
+selected_option          = 0
 selected_rocket_index    = 0
 selected_rocket_for_game = -1
 rocket_selected          = False
@@ -17,57 +18,47 @@ alert_message            = ""
 last_click_x, last_click_y = -1000, -1000
 animation_time           = 0.0
 planet_rotation_y        = 0.0
-frame_count              = 0
 
 cam_rx, cam_ry = 15.0, 0.0
 zoom_level     = 1.0
 
-main_menu    = ["START GAME", "OPTIONS", "QUIT"]
-options_menu = ["TUTORIAL", "CHECK ROCKET", "BACK"]
+main_menu    = ["START GAME", "CHECK ROCKET", "QUIT"]
 rocket_list  = ["JakHound F-22", "EvaNation F-15", "JF17 Thunder", "START MISSION"]
 
-# ── Lander ─────────────────────────────────────────────────────────────────
-lander_x = 0.0;  lander_y = 80.0;  lander_z = 0.0
+# ── Lander ──────────────────────────────────────────────────────────────────
+lander_x = 0.0; lander_y = 80.0; lander_z = 0.0
 vel_x = vel_y = vel_z = 0.0
-fuel = 100.0;  oxygen = 100.0
-game_started = False;  game_over = False;  landing_msg = ""
+fuel = 100.0; oxygen = 100.0
+game_started = False; game_over = False; landing_msg = ""
 lander_tilt_z = lander_tilt_x = rocket_heading = 0.0
-gp_cam_pitch = 22.0;  gp_cam_dist = 45.0
+gp_cam_pitch = 22.0; gp_cam_dist = 45.0
 
-score = 0;  level = 1
-target_x = target_z = 0.0;  target_surface_y = 0.0
+score = 0; level = 1
+target_x = target_z = 0.0; target_surface_y = 0.0
 new_target_flash_start = -999.0
-MAX_TILT = 22.0;  TILT_SPEED = 1.6;  TILT_RECOVERY = 2.8;  FUEL_REGEN = 0.28
+MAX_TILT = 22.0; TILT_SPEED = 1.6; TILT_RECOVERY = 2.8; FUEL_REGEN = 0.28
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  KEY STATE  — unified timestamp system for ALL keys
-#  Both keyboard_listener and special_key_listener call _key_press(token)
-#  idle() increments frame_count every tick; key_held() returns True while
-#  GLUT keeps firing auto-repeat (within KEY_WINDOW frames of grace).
-#  Physics runs in idle() so simultaneous keys work independently.
-# ═══════════════════════════════════════════════════════════════════════════
-KEY_WINDOW    = 6          # ~60 ms grace at 100fps — handles GLUT repeat gaps
-key_last_seen = {}         # token -> frame_count when last pressed
+# ── Key state (press/release) ────────────────────────────────────────────────
+key_state = {}
 
-def _key_press(token):
-    """Stamp a key as active. Called from BOTH keyboard and special callbacks."""
+def key_held(t):        return key_state.get(t, False)
+def key_up_held():      return key_held(b'\x00up')
+def key_dn_held():      return key_held(b'\x00dn')
+def key_w_held():       return key_held(b'w')
+def key_s_held():       return key_held(b's')
+def key_a_held():       return key_held(b'a')
+def key_d_held():       return key_held(b'd')
+def key_left_held():    return key_held(b'\x00lt')
+def key_right_held():   return key_held(b'\x00rt')
+
+def _set_key(t, v):
     global game_started
-    key_last_seen[token] = frame_count
-    if current_state == "GAMEPLAY":
+    key_state[t] = v
+    if v and current_state == "GAMEPLAY":
         game_started = True
 
-def key_held(token):
-    return key_last_seen.get(token, -9999) >= frame_count - KEY_WINDOW
-
-# Convenience aliases
-def key_up_held():    return key_held(b'\x00up')
-def key_dn_held():    return key_held(b'\x00dn')
-def key_w_held():     return key_held(b'w')
-def key_s_held():     return key_held(b's')
-def key_a_held():     return key_held(b'a')
-def key_d_held():     return key_held(b'd')
-def key_left_held():  return key_held(b'\x00lt')
-def key_right_held(): return key_held(b'\x00rt')
+def _clear_keys():
+    for t in list(key_state): key_state[t] = False
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  DIFFICULTY
@@ -82,236 +73,200 @@ def get_land_vel_max():  return max(4.5,  22.0 - (level-1)*1.8)
 def get_target_radius(): return max(0.8,   6.5 - (level-1)*0.60)
 def get_wind():
     if level < 4: return 0.0, 0.0
-    s = (level-3)*0.00028;  a = math.radians(animation_time*4.0)
+    s = (level-3)*0.00028; a = math.radians(animation_time*4.0)
     return math.cos(a)*s, math.sin(a)*s
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  TERRAIN
+#  TERRAIN  (procedural, stored as vertex grid, drawn with GL_TRIANGLES)
 # ═══════════════════════════════════════════════════════════════════════════
 WORLD_HALF   = 320
-TERRAIN_DIVS = 90
-_terrain_dl  = None
+TERRAIN_DIVS = 60          # reduced for performance without display lists
 _mountains   = []
 _craters     = []
+_terrain_verts = []        # precomputed flat list for drawing
 
 def terrain_height(wx, wz):
     y = 0.0
     for (cx, cz, rad, pk) in _mountains:
-        d = math.sqrt((wx-cx)**2 + (wz-cz)**2)
+        d = math.sqrt((wx-cx)**2+(wz-cz)**2)
         if d < rad:
-            t = 1.0 - d/rad;  y += pk*t*t*(3.0-2.0*t)
+            t = 1.0 - d/rad; y += pk*t*t*(3.0-2.0*t)
     for (cx, cz, rad, dep) in _craters:
-        d = math.sqrt((wx-cx)**2 + (wz-cz)**2)
+        d = math.sqrt((wx-cx)**2+(wz-cz)**2)
         if d < rad:
             t = d/rad
             y += -dep*(1.0-t*t) + dep*0.42*math.exp(-((t-0.86)/0.07)**2)
     return y
 
-def _build_terrain_dl():
-    global _terrain_dl
-    step = (WORLD_HALF*2)/TERRAIN_DIVS;  cols = TERRAIN_DIVS+1
+def generate_terrain():
+    global _mountains, _craters, _terrain_verts
+    rng = random.Random(level*31+7)
+    _mountains = []
+    for _ in range(16+level*2):
+        _mountains.append((rng.uniform(-WORLD_HALF+20, WORLD_HALF-20),
+                           rng.uniform(-WORLD_HALF+20, WORLD_HALF-20),
+                           rng.uniform(28,85), rng.uniform(18,55)))
+    for _ in range(4+level):
+        _mountains.append((rng.uniform(-WORLD_HALF+40, WORLD_HALF-40),
+                           rng.uniform(-WORLD_HALF+40, WORLD_HALF-40),
+                           rng.uniform(20,45), rng.uniform(55,90)))
+    _craters = []
+    for _ in range(20+level*2):
+        _craters.append((rng.uniform(-WORLD_HALF+10, WORLD_HALF-10),
+                         rng.uniform(-WORLD_HALF+10, WORLD_HALF-10),
+                         rng.uniform(8,42), rng.uniform(5,20)))
+    # Precompute vertex grid
+    step = (WORLD_HALF*2)/TERRAIN_DIVS; cols = TERRAIN_DIVS+1
     verts = []
     for row in range(cols):
         for col in range(cols):
-            wx = -WORLD_HALF + col*step;  wz = -WORLD_HALF + row*step
+            wx = -WORLD_HALF + col*step; wz = -WORLD_HALF + row*step
             verts.append((wx, terrain_height(wx, wz), wz))
-    if _terrain_dl is not None:
-        glDeleteLists(_terrain_dl, 1)
-    dl = glGenLists(1)
-    glNewList(dl, GL_COMPILE)
+    _terrain_verts = (verts, step, cols)
+
+def draw_terrain():
+    if not _terrain_verts: return
+    verts, step, cols = _terrain_verts
     glBegin(GL_TRIANGLES)
     for row in range(TERRAIN_DIVS):
         for col in range(TERRAIN_DIVS):
-            i00=row*cols+col; i10=i00+1; i01=i00+cols; i11=i01+1
-            def emit(ia, ib, ic):
-                va,vb,vc = verts[ia],verts[ib],verts[ic]
-                ux,uy,uz = vb[0]-va[0],vb[1]-va[1],vb[2]-va[2]
-                vx2,vy2,vz2 = vc[0]-va[0],vc[1]-va[1],vc[2]-va[2]
-                nx=uy*vz2-uz*vy2; ny=uz*vx2-ux*vz2; nz2=ux*vy2-uy*vx2
-                ln=math.sqrt(nx*nx+ny*ny+nz2*nz2)
-                if ln>1e-9: nx/=ln; ny/=ln; nz2/=ln
-                glNormal3f(nx,ny,nz2)
-                for v in (va,vb,vc):
-                    t=max(0.0,min(1.0,(v[1]+18)/62.0)); b=0.18+t*0.36
-                    glColor3f(b*0.96,b,b*1.06); glVertex3f(v[0],v[1],v[2])
-            emit(i00,i10,i01); emit(i10,i11,i01)
-    glEnd(); glEndList()
-    _terrain_dl = dl
-
-def generate_terrain():
-    global _mountains, _craters
-    rng = random.Random(level*31+7)
-    _mountains = []
-    for _ in range(22+level*2):
-        _mountains.append((rng.uniform(-WORLD_HALF+20,WORLD_HALF-20),
-                           rng.uniform(-WORLD_HALF+20,WORLD_HALF-20),
-                           rng.uniform(28,85), rng.uniform(18,55)))
-    for _ in range(6+level):
-        _mountains.append((rng.uniform(-WORLD_HALF+40,WORLD_HALF-40),
-                           rng.uniform(-WORLD_HALF+40,WORLD_HALF-40),
-                           rng.uniform(20,45), rng.uniform(55,90)))
-    _craters = []
-    for _ in range(30+level*2):
-        _craters.append((rng.uniform(-WORLD_HALF+10,WORLD_HALF-10),
-                         rng.uniform(-WORLD_HALF+10,WORLD_HALF-10),
-                         rng.uniform(8,42), rng.uniform(5,20)))
-    for _ in range(4):
-        _craters.append((rng.uniform(-WORLD_HALF+60,WORLD_HALF-60),
-                         rng.uniform(-WORLD_HALF+60,WORLD_HALF-60),
-                         rng.uniform(50,90), rng.uniform(18,32)))
-    _build_terrain_dl()
+            i00 = row*cols+col; i10 = i00+1; i01 = i00+cols; i11 = i01+1
+            for ia, ib, ic in [(i00,i10,i01),(i10,i11,i01)]:
+                for idx in (ia, ib, ic):
+                    v = verts[idx]
+                    t = max(0.0, min(1.0, (v[1]+18)/62.0)); b = 0.18+t*0.36
+                    glColor3f(b*0.96, b, b*1.06)
+                    glVertex3f(v[0], v[1], v[2])
+    glEnd()
 
 def move_target():
-    global target_x,target_z,target_surface_y,new_target_flash_start
+    global target_x, target_z, target_surface_y, new_target_flash_start
     rng = random.Random(level*17+score*3+int(animation_time*100))
     spread = min(WORLD_HALF-30, 80+level*9)
     for _ in range(800):
-        a=rng.uniform(0,2*math.pi); d=rng.uniform(max(80,spread*0.55),spread)
-        tx=math.cos(a)*d; tz=math.sin(a)*d
+        a = rng.uniform(0,2*math.pi); d = rng.uniform(max(80,spread*0.55),spread)
+        tx = math.cos(a)*d; tz = math.sin(a)*d
         if abs(tx)<WORLD_HALF-15 and abs(tz)<WORLD_HALF-15:
-            target_x,target_z=tx,tz; break
-    target_surface_y=terrain_height(target_x,target_z)
-    new_target_flash_start=animation_time
+            target_x,target_z = tx,tz; break
+    target_surface_y = terrain_height(target_x,target_z)
+    new_target_flash_start = animation_time
     generate_terrain()
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  PROJECTION & CAMERA
+#  CAMERA
 # ═══════════════════════════════════════════════════════════════════════════
-def set_perspective(fovy_deg, aspect, znear, zfar):
-    glMatrixMode(GL_PROJECTION); glLoadIdentity()
-    f = 1.0/math.tan(math.radians(fovy_deg)*0.5)
-    top=znear/f; right=top*aspect
-    glFrustum(-right,right,-top,top,znear,zfar)
+def setup_3d_camera():
+    glMatrixMode(GL_PROJECTION)
+    glLoadIdentity()
+    gluPerspective(58, WIN_W/WIN_H, 1.0, 1800.0)
+    glMatrixMode(GL_MODELVIEW)
+    glLoadIdentity()
 
-def set_camera(ex,ey,ez,cx,cy,cz):
-    glMatrixMode(GL_MODELVIEW); glLoadIdentity()
-    fx=cx-ex; fy=cy-ey; fz=cz-ez
-    fl=math.sqrt(fx*fx+fy*fy+fz*fz)
-    if fl<1e-9: return
-    fx/=fl; fy/=fl; fz/=fl
-    yaw  =math.degrees(math.atan2(-fx,-fz))
-    pitch=math.degrees(math.asin(max(-1.0,min(1.0,fy))))
-    glRotatef(-pitch,1,0,0); glRotatef(-yaw,0,1,0)
-    glTranslatef(-ex,-ey,-ez)
+def setup_gameplay_camera():
+    glMatrixMode(GL_PROJECTION)
+    glLoadIdentity()
+    gluPerspective(58, WIN_W/WIN_H, 1.0, 1800.0)
+    glMatrixMode(GL_MODELVIEW)
+    glLoadIdentity()
+    hr = math.radians(rocket_heading); pr = math.radians(gp_cam_pitch)
+    ecx = lander_x - math.sin(hr)*gp_cam_dist*math.cos(pr)
+    ecy = lander_y + gp_cam_dist*math.sin(pr)
+    ecz = lander_z - math.cos(hr)*gp_cam_dist*math.cos(pr)
+    gluLookAt(ecx, ecy, ecz, lander_x, lander_y, lander_z, 0, 1, 0)
 
-def _ortho_push():
-    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity()
-    glScalef(2.0/WIN_W,2.0/WIN_H,-0.001)
-    glTranslatef(-WIN_W/2.0,-WIN_H/2.0,0.0)
-    glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity()
+def setup_menu_camera():
+    glMatrixMode(GL_PROJECTION)
+    glLoadIdentity()
+    gluPerspective(45, WIN_W/WIN_H, 0.1, 600.0)
+    glMatrixMode(GL_MODELVIEW)
+    glLoadIdentity()
+    gluLookAt(0, 0, 60, 0, 0, 0, 0, 1, 0)
 
-def _ortho_pop():
-    glMatrixMode(GL_PROJECTION); glPopMatrix()
-    glMatrixMode(GL_MODELVIEW);  glPopMatrix()
+def setup_rocket_viewer_camera():
+    glMatrixMode(GL_PROJECTION)
+    glLoadIdentity()
+    gluPerspective(45, WIN_W/WIN_H, 0.1, 100.0)
+    glMatrixMode(GL_MODELVIEW)
+    glLoadIdentity()
+    # Orbit camera controlled by cam_rx/cam_ry
+    ex = 25*zoom_level * math.sin(math.radians(cam_ry)) * math.cos(math.radians(cam_rx))
+    ey = 25*zoom_level * math.sin(math.radians(cam_rx))
+    ez = 25*zoom_level * math.cos(math.radians(cam_ry)) * math.cos(math.radians(cam_rx))
+    gluLookAt(ex, ey, ez, 0, 1.5, 0, 0, 1, 0)
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  GL PRIMITIVES
+#  HUD TEXT  (glRasterPos2f + glutBitmapCharacter)
 # ═══════════════════════════════════════════════════════════════════════════
-def draw_cylinder(r,h,sides=16):
-    step=2*math.pi/sides
+def draw_text(x, y, text, r=1.0, g=1.0, b=1.0):
+    glMatrixMode(GL_PROJECTION)
+    glPushMatrix()
+    glLoadIdentity()
+    glScalef(2.0/WIN_W, 2.0/WIN_H, 1.0)
+    glTranslatef(-WIN_W/2.0, -WIN_H/2.0, 0.0)
+    glMatrixMode(GL_MODELVIEW)
+    glPushMatrix()
+    glLoadIdentity()
+    glColor3f(r, g, b)
+    glRasterPos2f(x, y)
+    for ch in text:
+        glutBitmapCharacter(GLUT_BITMAP_9_BY_15, ord(ch))
+    glMatrixMode(GL_PROJECTION)
+    glPopMatrix()
+    glMatrixMode(GL_MODELVIEW)
+    glPopMatrix()
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  GL PRIMITIVES  (only allowed functions)
+# ═══════════════════════════════════════════════════════════════════════════
+def draw_cylinder(r, h, sides=14):
+    step = 2*math.pi/sides
+    # Side
     glBegin(GL_QUAD_STRIP)
     for i in range(sides+1):
-        a=i*step; ca=math.cos(a); sa=math.sin(a)
-        glNormal3f(ca,0,sa); glVertex3f(r*ca,0,r*sa); glVertex3f(r*ca,h,r*sa)
+        a = i*step; ca = math.cos(a); sa = math.sin(a)
+        glVertex3f(r*ca, 0, r*sa); glVertex3f(r*ca, h, r*sa)
     glEnd()
-    for yy,ny in [(0,-1),(h,1)]:
+    # Caps
+    for yy, ny in [(0, -1), (h, 1)]:
         glBegin(GL_TRIANGLE_FAN)
-        glNormal3f(0,ny,0); glVertex3f(0,yy,0)
-        rr=range(sides,-1,-1) if ny<0 else range(sides+1)
-        for i in rr: a=i*step; glVertex3f(r*math.cos(a),yy,r*math.sin(a))
+        glVertex3f(0, yy, 0)
+        rr = range(sides, -1, -1) if ny < 0 else range(sides+1)
+        for i in rr: a = i*step; glVertex3f(r*math.cos(a), yy, r*math.sin(a))
         glEnd()
 
-def draw_cone(r,h,sides=16):
-    step=2*math.pi/sides
+def draw_cone(r, h, sides=14):
+    step = 2*math.pi/sides
     glBegin(GL_TRIANGLE_FAN)
-    glNormal3f(0,1,0); glVertex3f(0,h,0)
-    for i in range(sides+1): a=i*step; glVertex3f(r*math.cos(a),0,r*math.sin(a))
+    glVertex3f(0, h, 0)
+    for i in range(sides+1): a = i*step; glVertex3f(r*math.cos(a), 0, r*math.sin(a))
     glEnd()
     glBegin(GL_TRIANGLE_FAN)
-    glNormal3f(0,-1,0); glVertex3f(0,0,0)
-    for i in range(sides,-1,-1): a=i*step; glVertex3f(r*math.cos(a),0,r*math.sin(a))
+    glVertex3f(0, 0, 0)
+    for i in range(sides, -1, -1): a = i*step; glVertex3f(r*math.cos(a), 0, r*math.sin(a))
     glEnd()
 
-def draw_sphere(r,stacks=10,slices=14):
-    for i in range(stacks):
-        lat0=math.pi*(-0.5+i/stacks); lat1=math.pi*(-0.5+(i+1)/stacks)
-        z0,zr0=math.sin(lat0),math.cos(lat0); z1,zr1=math.sin(lat1),math.cos(lat1)
-        glBegin(GL_QUAD_STRIP)
-        for j in range(slices+1):
-            lng=2*math.pi*j/slices; x=math.cos(lng); y=math.sin(lng)
-            glNormal3f(x*zr0,z0,y*zr0); glVertex3f(r*x*zr0,r*z0,r*y*zr0)
-            glNormal3f(x*zr1,z1,y*zr1); glVertex3f(r*x*zr1,r*z1,r*y*zr1)
-        glEnd()
-
-def draw_box(sx,sy,sz):
-    hx,hy,hz=sx/2,sy/2,sz/2
+def draw_box(sx, sy, sz):
+    hx, hy, hz = sx/2, sy/2, sz/2
     glBegin(GL_QUADS)
-    for vts,nm in [
-        ([(hx,hy,hz),(hx,-hy,hz),(hx,-hy,-hz),(hx,hy,-hz)],(1,0,0)),
-        ([(-hx,hy,-hz),(-hx,-hy,-hz),(-hx,-hy,hz),(-hx,hy,hz)],(-1,0,0)),
-        ([(-hx,hy,-hz),(hx,hy,-hz),(hx,hy,hz),(-hx,hy,hz)],(0,1,0)),
-        ([(-hx,-hy,hz),(hx,-hy,hz),(hx,-hy,-hz),(-hx,-hy,-hz)],(0,-1,0)),
-        ([(-hx,hy,hz),(hx,hy,hz),(hx,-hy,hz),(-hx,-hy,hz)],(0,0,1)),
-        ([(hx,hy,-hz),(-hx,hy,-hz),(-hx,-hy,-hz),(hx,-hy,-hz)],(0,0,-1))]:
-        glNormal3f(*nm)
+    for vts in [
+        [( hx, hy, hz),( hx,-hy, hz),( hx,-hy,-hz),( hx, hy,-hz)],
+        [(-hx, hy,-hz),(-hx,-hy,-hz),(-hx,-hy, hz),(-hx, hy, hz)],
+        [(-hx, hy,-hz),( hx, hy,-hz),( hx, hy, hz),(-hx, hy, hz)],
+        [(-hx,-hy, hz),( hx,-hy, hz),( hx,-hy,-hz),(-hx,-hy,-hz)],
+        [(-hx, hy, hz),( hx, hy, hz),( hx,-hy, hz),(-hx,-hy, hz)],
+        [( hx, hy,-hz),(-hx, hy,-hz),(-hx,-hy,-hz),( hx,-hy,-hz)]]:
         for v in vts: glVertex3f(*v)
     glEnd()
 
-def draw_disk(r,sides=16):
+def draw_sphere_gl(r, stacks=10, slices=14):
+    q = gluNewQuadric()
+    gluSphere(q, r, slices, stacks)
+
+def draw_disk(r, sides=14):
     glBegin(GL_TRIANGLE_FAN)
-    glNormal3f(0,1,0); glVertex3f(0,0,0)
-    for i in range(sides+1): a=2*math.pi*i/sides; glVertex3f(r*math.cos(a),0,r*math.sin(a))
+    glVertex3f(0, 0, 0)
+    for i in range(sides+1): a = 2*math.pi*i/sides; glVertex3f(r*math.cos(a), 0, r*math.sin(a))
     glEnd()
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  TEXT & BUTTONS
-# ═══════════════════════════════════════════════════════════════════════════
-def draw_text(x,y,text,r,g,b,font=GLUT_BITMAP_9_BY_15):
-    glColor3f(r,g,b); tx=x
-    for ch in text:
-        glRasterPos2f(tx,y); glutBitmapCharacter(font,ord(ch)); tx+=9
-
-def draw_button(x,y,text,index):
-    global selected_option
-    tw=len(text)*10; x0,x1=x-tw/2-20,x+tw/2+20; y0,y1=y-10,y+25
-    gl_y=WIN_H-last_click_y
-    if x0<=last_click_x<=x1 and y0<=gl_y<=y1: selected_option=index
-    sel=(selected_option==index)
-    if sel:  draw_text(x-tw/2,y,text,1,1,1); glColor3f(1,0.2,0.2); glLineWidth(3)
-    else:    draw_text(x-tw/2,y,text,0.7,0.1,0.1); glColor3f(0.4,0,0); glLineWidth(1)
-    glBegin(GL_LINE_LOOP)
-    glVertex2f(x0,y0); glVertex2f(x1,y0); glVertex2f(x1,y1); glVertex2f(x0,y1)
-    glEnd(); glLineWidth(1)
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  MENU BACKGROUND
-# ═══════════════════════════════════════════════════════════════════════════
-star_data=[]
-for _ in range(600):
-    _tx,_ty=random.uniform(-100,100),random.uniform(-60,60)
-    star_data.append([_tx,_ty,random.uniform(-150,-20),random.uniform(0.5,0.9),_tx,_ty])
-
-def draw_interactive_scene():
-    set_perspective(45,WIN_W/WIN_H,0.1,600.0)
-    glMatrixMode(GL_MODELVIEW); glLoadIdentity()
-    glTranslatef(0,0,-60)
-    glPointSize(3.0); glBegin(GL_POINTS)
-    mx=(last_click_x-500)/6.0; my=(400-last_click_y)/6.0
-    for i,s in enumerate(star_data):
-        blink=0.2+0.6*abs(math.sin(animation_time*5+i))
-        glColor3f(blink*s[3],blink*s[3],blink*s[3])
-        dx,dy=mx-s[0],my-s[1]; dist=math.sqrt(dx**2+dy**2)
-        if dist<15: s[0]+=dx*0.05; s[1]+=dy*0.05
-        else:       s[0]+=(s[4]-s[0])*0.02; s[1]+=(s[5]-s[1])*0.02
-        glVertex3f(s[0],s[1],s[2])
-    glEnd()
-    glPushMatrix(); glTranslatef(22,-14,15)
-    glRotatef(planet_rotation_y+(last_click_x-500)/40.0,0,1,0)
-    glRotatef((last_click_y-400)/40.0,1,0,0)
-    glColor3f(0.8,0.8,0.82); draw_sphere(8,16,24)
-    glPushMatrix(); glRotatef(animation_time*8,1,1,0)
-    glColor3f(0.3,0.3,0.32); draw_sphere(8.1,6,8); glPopMatrix()
-    glPopMatrix()
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  ROCKET MODELS
@@ -321,14 +276,14 @@ def draw_jak_hound():
     glColor3f(0.85,0.60,0.10)
     glPushMatrix(); glTranslatef(0,1.65,0); draw_cylinder(0.31,0.22,8); glPopMatrix()
     glColor3f(0.05,0.55,0.95)
-    glPushMatrix(); glTranslatef(0,1.52,0.33); draw_sphere(0.09,6,8); glPopMatrix()
+    glPushMatrix(); glTranslatef(0,1.52,0.33); draw_sphere_gl(0.09,6,8); glPopMatrix()
     glColor3f(0.75,0.55,0.08)
     for py in [0.30,0.65,1.00,1.35]:
         glPushMatrix(); glTranslatef(0,py,0.29); draw_box(0.34,0.025,0.04); glPopMatrix()
     glColor3f(0.18,0.18,0.20)
     glPushMatrix(); glTranslatef(0,2.10,0); draw_cone(0.28,0.95,8); glPopMatrix()
     glColor3f(0.80,0.60,0.10)
-    glPushMatrix(); glTranslatef(0,3.05,0); draw_sphere(0.07,6,8); glPopMatrix()
+    glPushMatrix(); glTranslatef(0,3.05,0); draw_sphere_gl(0.07,6,8); glPopMatrix()
     glColor3f(0.12,0.12,0.14); draw_disk(0.32,8)
     for i in range(4):
         glColor3f(0.12,0.12,0.14); glPushMatrix(); glRotatef(i*90,0,1,0)
@@ -349,13 +304,11 @@ def draw_eva_nation():
     glColor3f(0.90,0.40,0.65)
     glPushMatrix(); glTranslatef(0,2.2,0); draw_cone(0.38,1.10,16); glPopMatrix()
     glColor3f(1.0,0.80,0.90)
-    glPushMatrix(); glTranslatef(0,3.30,0); draw_sphere(0.08,6,8); glPopMatrix()
+    glPushMatrix(); glTranslatef(0,3.30,0); draw_sphere_gl(0.08,6,8); glPopMatrix()
     glColor3f(0.85,0.45,0.70); draw_disk(0.42,16)
     for i,col in enumerate([(0.80,0.35,0.60),(0.90,0.45,0.70),(0.80,0.35,0.60),(0.90,0.45,0.70)]):
         glColor3f(*col); glPushMatrix(); glRotatef(i*90,0,1,0)
         glTranslatef(0.38,0.10,0); draw_box(0.55,0.85,0.06); glPopMatrix()
-    glColor3f(0.55,0.15,0.80)
-    glPushMatrix(); glTranslatef(0,0.05,0); draw_cylinder(0.44,0.05,32); glPopMatrix()
 
 def draw_jf17_thunder():
     glColor3f(0.55,0.05,0.05); draw_cylinder(0.32,2.0,6)
@@ -368,12 +321,12 @@ def draw_jf17_thunder():
     glColor3f(0.65,0.07,0.07)
     glPushMatrix(); glTranslatef(0,2.0,0); draw_cone(0.30,0.90,6); glPopMatrix()
     glColor3f(0.9,0.3,0.3)
-    glPushMatrix(); glTranslatef(0,2.90,0); draw_sphere(0.06,6,8); glPopMatrix()
+    glPushMatrix(); glTranslatef(0,2.90,0); draw_sphere_gl(0.06,6,8); glPopMatrix()
     glColor3f(0.45,0.04,0.04); draw_disk(0.34,6)
     for i in range(4):
         glColor3f(0.50,0.05,0.05); glPushMatrix(); glRotatef(i*90,0,1,0)
         glTranslatef(0.44,0.15,0); draw_box(0.40,0.70,0.06); glPopMatrix()
-    flame=0.5+0.5*math.sin(animation_time*8.0)
+    flame = 0.5+0.5*math.sin(animation_time*8.0)
     glColor3f(1.0,0.4+0.3*flame,0.0)
     glPushMatrix(); glTranslatef(0,-0.05,0); draw_cone(0.15,0.5+0.4*flame,12); glPopMatrix()
 
@@ -384,292 +337,302 @@ def draw_selected_rocket():
     else: draw_jak_hound()
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  SPACE BACKGROUND & TERRAIN
+#  SPACE BACKGROUND  (stars + planets)
 # ═══════════════════════════════════════════════════════════════════════════
+_star_seed = 7
 def draw_space_background():
-    glPointSize(2.0); glBegin(GL_POINTS)
-    random.seed(7)
+    glBegin(GL_POINTS)
+    random.seed(_star_seed)
     for _ in range(500):
-        ang=random.uniform(0,2*math.pi); el=random.uniform(-math.pi/2,math.pi/2)
-        glColor3f(random.uniform(0.6,1.0),random.uniform(0.6,1.0),random.uniform(0.7,1.0))
-        glVertex3f(450*math.cos(el)*math.cos(ang),450*math.sin(el),450*math.cos(el)*math.sin(ang))
+        ang = random.uniform(0,2*math.pi); el = random.uniform(-math.pi/2,math.pi/2)
+        b = random.uniform(0.6,1.0)
+        glColor3f(b, b, min(1.0,b+0.1))
+        glVertex3f(450*math.cos(el)*math.cos(ang), 450*math.sin(el), 450*math.cos(el)*math.sin(ang))
     glEnd()
     glPushMatrix(); glRotatef(planet_rotation_y*0.1,0,1,0); glTranslatef(400,100,0)
-    glColor3f(1.0,0.9,0.3); draw_sphere(22,12,18); glPopMatrix()
+    glColor3f(1.0,0.9,0.3); draw_sphere_gl(22,12,18); glPopMatrix()
     glPushMatrix(); glRotatef(planet_rotation_y*0.3,0,1,0); glTranslatef(260,40,-130)
-    glColor3f(0.1,0.4,0.8); draw_sphere(12,10,16)
-    glColor3f(0.9,0.9,0.9); glPushMatrix(); glRotatef(planet_rotation_y*2,0,1,0)
-    draw_sphere(12.3,5,8); glPopMatrix(); glPopMatrix()
+    glColor3f(0.1,0.4,0.8); draw_sphere_gl(12,10,16)
+    glColor3f(0.9,0.9,0.9)
+    glPushMatrix(); glRotatef(planet_rotation_y*2,0,1,0); draw_sphere_gl(12.3,5,8); glPopMatrix()
+    glPopMatrix()
     glPushMatrix(); glRotatef(planet_rotation_y*0.2,0,1,0); glTranslatef(-220,-25,180)
-    glColor3f(0.7,0.25,0.1); draw_sphere(7,8,12); glPopMatrix()
-
-def draw_terrain():
-    if _terrain_dl is None: return
-    glCallList(_terrain_dl)
+    glColor3f(0.7,0.25,0.1); draw_sphere_gl(7,8,12); glPopMatrix()
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  TARGET & INDICATORS
+#  MENU BACKGROUND  (stars + rotating planet, drawn in 3D)
+# ═══════════════════════════════════════════════════════════════════════════
+star_data = []
+for _ in range(300):
+    _tx,_ty = random.uniform(-80,80), random.uniform(-50,50)
+    star_data.append([_tx,_ty,random.uniform(-120,-20),random.uniform(0.5,0.9)])
+
+def draw_menu_scene():
+    glBegin(GL_POINTS)
+    for i,s in enumerate(star_data):
+        blink = 0.3+0.5*abs(math.sin(animation_time*4+i))
+        glColor3f(blink*s[3], blink*s[3], blink*s[3])
+        glVertex3f(s[0], s[1], s[2])
+    glEnd()
+    glPushMatrix(); glTranslatef(18,-10,10)
+    glRotatef(planet_rotation_y, 0,1,0)
+    glColor3f(0.75,0.75,0.80); draw_sphere_gl(7,14,20)
+    glColor3f(0.28,0.28,0.30)
+    glPushMatrix(); glRotatef(animation_time*6,1,1,0); draw_sphere_gl(7.1,5,7); glPopMatrix()
+    glPopMatrix()
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  MENU BUTTONS  (drawn with GL_QUADS + text)
+# ═══════════════════════════════════════════════════════════════════════════
+def draw_menu_button(label, index, cx, cy):
+    """Draw a 2D button using screen-space coordinates via text system."""
+    sel = (selected_option == index)
+    r,g,b = (1.0,1.0,1.0) if sel else (0.7,0.15,0.15)
+    draw_text(cx - len(label)*4, cy, label, r, g, b)
+    # Underline for selected
+    if sel:
+        draw_text(cx - len(label)*4 - 3, cy, "> " + label + " <", 1.0, 0.3, 0.3)
+
+def draw_menu_buttons():
+    items = main_menu if current_state == "MENU" else rocket_list
+    draw_text(WIN_W//2 - 80, WIN_H - 60, "LUNAR DESCENT", 0.8, 0.8, 1.0)
+    for i, label in enumerate(items):
+        cy = 500 - i*80
+        sel = (selected_option == i)
+        col = (1.0,0.9,0.2) if sel else (0.6,0.1,0.1)
+        prefix = ">>  " if sel else "    "
+        draw_text(WIN_W//2 - len(label)*5 - 30, cy, prefix + label, *col)
+    if show_alert:
+        draw_text(WIN_W//2 - 120, 300, alert_message, 1.0, 0.2, 0.2)
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  TARGET MARKER
 # ═══════════════════════════════════════════════════════════════════════════
 def draw_target():
-    cx,cz=target_x,target_z; sy=terrain_height(cx,cz)
-    rad=get_target_radius(); pulse=0.5+0.5*math.sin(animation_time*4.0)
-    danger=min(1.0,(level-1)/9.0); tg=1.0-danger*0.8
-    for ring_r,lw in [(rad+2.0,3.0),(rad,2.2),(rad*0.5,2.0)]:
-        glColor3f(1.0,tg*(pulse*0.8+0.2),0.0); glLineWidth(lw)
+    cx,cz = target_x,target_z; sy = terrain_height(cx,cz)
+    rad = get_target_radius(); pulse = 0.5+0.5*math.sin(animation_time*4.0)
+    danger = min(1.0,(level-1)/9.0); tg = 1.0-danger*0.8
+    # Rings
+    for ring_r,thick in [(rad+2.0,3.5),(rad,2.5),(rad*0.5,2.0)]:
+        glColor3f(1.0, tg*(pulse*0.8+0.2), 0.0)
         glBegin(GL_LINE_LOOP)
-        for s in range(64):
-            a=2*math.pi*s/64; wx2=cx+ring_r*math.cos(a); wz2=cz+ring_r*math.sin(a)
-            glVertex3f(wx2,terrain_height(wx2,wz2)+0.15,wz2)
+        for s in range(48):
+            a = 2*math.pi*s/48; wx2 = cx+ring_r*math.cos(a); wz2 = cz+ring_r*math.sin(a)
+            glVertex3f(wx2, terrain_height(wx2,wz2)+0.15, wz2)
         glEnd()
-    glColor3f(1.0,tg,0.0); glLineWidth(2.5)
+    # Crosshair
+    glColor3f(1.0,tg,0.0)
     glBegin(GL_LINES)
     glVertex3f(cx-(rad+3),sy+0.15,cz); glVertex3f(cx+(rad+3),sy+0.15,cz)
     glVertex3f(cx,sy+0.15,cz-(rad+3)); glVertex3f(cx,sy+0.15,cz+(rad+3))
     glEnd()
-    glColor3f(1.0,0.6,0.0); glLineWidth(1.5)
-    for tick in range(8):
-        a=2*math.pi*tick/8+animation_time*0.8
-        glBegin(GL_LINES)
-        glVertex3f(cx+rad*0.75*math.cos(a),sy+0.15,cz+rad*0.75*math.sin(a))
-        glVertex3f(cx+rad*1.12*math.cos(a),sy+0.15,cz+rad*1.12*math.sin(a))
-        glEnd()
-    bh=sy+40.0+pulse*6.0
-    glColor3f(1.0,tg,0.0); glLineWidth(1.5)
+    # Beacon line
+    bh = sy+38.0+pulse*5.0
+    glColor3f(1.0,tg,0.0)
     glBegin(GL_LINES); glVertex3f(cx,sy+0.1,cz); glVertex3f(cx,bh,cz); glEnd()
-    glPointSize(10.0); glColor3f(1.0,1.0,0.2*pulse)
-    glBegin(GL_POINTS); glVertex3f(cx,bh,cz); glEnd()
-    glPointSize(1.0); glLineWidth(1.0)
-
-def draw_new_target_arrow():
-    elapsed=animation_time-new_target_flash_start
-    if elapsed>5.0: return
-    fade=1.0-elapsed/5.0; alpha=fade*abs(math.sin(animation_time*8.0))
-    dx=target_x-lander_x; dz=target_z-lander_z
-    dist=math.sqrt(dx**2+dz**2)
-    if dist<0.01: return
-    nx2=dx/dist; nz2=dz/dist
-    ax=lander_x+nx2*8; az=lander_z+nz2*8; ay=lander_y+3.0
-    glLineWidth(4.0); glColor3f(alpha,alpha*0.85,0.0)
-    glBegin(GL_LINES); glVertex3f(lander_x,ay,lander_z); glVertex3f(ax,ay,az); glEnd()
-    glPointSize(13.0); glBegin(GL_POINTS); glVertex3f(ax,ay,az); glEnd()
-    glPointSize(1.0); glLineWidth(1.0)
+    # Beacon dot
+    glPushMatrix(); glTranslatef(cx,bh,cz)
+    glColor3f(1.0,1.0,0.2*pulse); draw_sphere_gl(0.8,5,8)
+    glPopMatrix()
 
 def draw_heading_indicator():
-    sy=terrain_height(lander_x,lander_z)
-    hr=math.radians(rocket_heading)
-    ex2=lander_x+math.sin(hr)*6; ez2=lander_z+math.cos(hr)*6
-    glColor3f(0.0,1.0,1.0); glLineWidth(2.5)
+    sy = terrain_height(lander_x,lander_z)
+    hr = math.radians(rocket_heading)
+    ex2 = lander_x+math.sin(hr)*6; ez2 = lander_z+math.cos(hr)*6
+    glColor3f(0.0,1.0,1.0)
     glBegin(GL_LINES)
-    glVertex3f(lander_x,sy+0.35,lander_z)
-    glVertex3f(ex2,terrain_height(ex2,ez2)+0.35,ez2)
-    glEnd(); glLineWidth(1.0)
+    glVertex3f(lander_x,sy+0.4,lander_z); glVertex3f(ex2,terrain_height(ex2,ez2)+0.4,ez2)
+    glEnd()
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  THRUST FLAMES
+# ═══════════════════════════════════════════════════════════════════════════
 def draw_thrust_flame():
-    if not key_up_held(): return
-    if fuel<=0 and oxygen<=0: return
-    on_oxy=(fuel<=0 and oxygen>0); flame=0.5+0.5*math.sin(animation_time*15.0)
-    glColor3f(0.4,0.6+0.3*flame,1.0) if on_oxy else glColor3f(1.0,0.5+0.3*flame,0.0)
+    if not key_up_held() or (fuel<=0 and oxygen<=0): return
+    on_oxy = (fuel<=0 and oxygen>0); flame = 0.5+0.5*math.sin(animation_time*15.0)
+    if on_oxy: glColor3f(0.4,0.6+0.3*flame,1.0)
+    else:      glColor3f(1.0,0.5+0.3*flame,0.0)
     glPushMatrix(); glTranslatef(0,-0.5,0); draw_cone(0.3,1.0+0.6*flame,12); glPopMatrix()
 
 def draw_retro_flame():
     if not key_dn_held() or (fuel<=0 and oxygen<=0): return
-    flame=0.4+0.4*math.sin(animation_time*15.0); glColor3f(0.5,0.8+0.2*flame,1.0)
+    flame = 0.4+0.4*math.sin(animation_time*15.0); glColor3f(0.5,0.8+0.2*flame,1.0)
     glPushMatrix(); glTranslatef(0,2.5,0); glRotatef(180,1,0,0); draw_cone(0.2,0.6+0.4*flame,12); glPopMatrix()
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  TRAJECTORY
+#  TRAJECTORY PREVIEW
 # ═══════════════════════════════════════════════════════════════════════════
 def draw_trajectory():
-    px,py,pz=lander_x,lander_y,lander_z
-    vx,vy,vz=vel_x,vel_y,vel_z; sf,so=fuel,oxygen
-    hr=math.radians(rocket_heading)
-    fwx=math.sin(hr); fwz=math.cos(hr)
-    rtx=math.cos(hr); rtz=-math.sin(hr)
+    px,py,pz = lander_x,lander_y,lander_z
+    vx,vy,vz = vel_x,vel_y,vel_z; sf,so = fuel,oxygen
+    hr = math.radians(rocket_heading)
+    fwx = math.sin(hr); fwz = math.cos(hr)
+    rtx = math.cos(hr); rtz = -math.sin(hr)
     G=diff_gravity(); DR=diff_drag(); TU=diff_thrust_up()
     TH=diff_thrust_horiz(); FB=diff_fuel_burn(); MX=diff_max_vel()
-    ku=key_up_held(); kd=key_dn_held()
-    kw=key_w_held(); ks=key_s_held(); ka=key_a_held(); kk=key_d_held()
-    pts=[(px,py,pz)]
-    for _ in range(500):
+    pts = [(px,py,pz)]
+    for _ in range(400):
         vy+=G; hf=sf>0; ho=so>0
-        if ku:
-            if hf:   vy+=TU; sf=max(0,sf-FB)
+        if key_up_held():
+            if hf: vy+=TU; sf=max(0,sf-FB)
             elif ho: vy+=TU*0.55; so=max(0,so-0.10)
-        if kd:
-            if hf:   vy-=TU*0.45; sf=max(0,sf-FB*0.5)
-            elif ho: vy-=TU*0.25; so=max(0,so-0.06)
-        if kw: vx+=fwx*TH; vz+=fwz*TH
-        if ks: vx-=fwx*TH; vz-=fwz*TH
-        if ka: vx-=rtx*TH; vz-=rtz*TH
-        if kk: vx+=rtx*TH; vz+=rtz*TH
-        wx2,wz2=get_wind(); vx+=wx2; vz+=wz2
+        if key_w_held(): vx+=fwx*TH; vz+=fwz*TH
+        if key_s_held(): vx-=fwx*TH; vz-=fwz*TH
+        if key_a_held(): vx-=rtx*TH; vz-=rtz*TH
+        if key_d_held(): vx+=rtx*TH; vz+=rtz*TH
         vx*=DR; vz*=DR
         vx=max(-MX,min(MX,vx)); vz=max(-MX,min(MX,vz)); vy=max(-MX,min(MX,vy))
         px+=vx; py+=vy; pz+=vz
-        gy=terrain_height(px,pz)
-        if py<=gy+0.5: py=gy+0.5; pts.append((px,py,pz)); break
+        gy = terrain_height(px,pz)
+        if py<=gy+0.5: pts.append((px,py,pz)); break
         pts.append((px,py,pz))
-    if len(pts)<2: return
-    spd=math.sqrt(vx**2+vy**2+vz**2)*60; lv=get_land_vel_max()
-    lr,lg,lb=(0.2,1.0,0.3) if spd<=lv else (1.0,0.85,0.0) if spd<=lv*1.5 else (1.0,0.2,0.1)
-    glLineWidth(1.8); glBegin(GL_LINE_STRIP)
+    if len(pts) < 2: return
+    spd = math.sqrt(vx**2+vy**2+vz**2)*60; lv = get_land_vel_max()
+    lr,lg,lb = (0.2,1.0,0.3) if spd<=lv else (1.0,0.85,0.0) if spd<=lv*1.5 else (1.0,0.2,0.1)
+    glBegin(GL_LINE_STRIP)
     for idx,(tx2,ty2,tz2) in enumerate(pts):
-        fade=1.0-(idx/len(pts))*0.7
+        fade = 1.0-(idx/len(pts))*0.7
         glColor3f(lr*fade,lg*fade,lb*fade); glVertex3f(tx2,ty2,tz2)
-    glEnd(); glLineWidth(1.0)
-    ix,iy,iz=pts[-1]; glColor3f(lr,lg,lb); glLineWidth(2.0)
-    glBegin(GL_LINES)
-    glVertex3f(ix-2,iy+0.15,iz); glVertex3f(ix+2,iy+0.15,iz)
-    glVertex3f(ix,iy+0.15,iz-2); glVertex3f(ix,iy+0.15,iz+2)
     glEnd()
-    glPointSize(7.0); glBegin(GL_POINTS); glVertex3f(ix,iy+0.15,iz); glEnd()
-    glPointSize(1.0); glLineWidth(1.0)
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  MINIMAP
+#  MINIMAP  (drawn in a corner using 2D projection trick — no glViewport)
 # ═══════════════════════════════════════════════════════════════════════════
 def draw_minimap():
-    MW=200; MH=200; MX_vp=WIN_W-MW-10; MY_vp=10
-    glPushAttrib(GL_VIEWPORT_BIT)
-    glViewport(MX_vp,MY_vp,MW,MH)
-    half=float(WORLD_HALF+10)
-    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity()
-    glScalef(1.0/half,1.0/half,1.0)
-    glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity()
-    glDisable(GL_DEPTH_TEST)
-    glColor3f(0.04,0.04,0.10)
+    # Switch to a 2D-like projection centered at top-right corner
+    glMatrixMode(GL_PROJECTION)
+    glPushMatrix()
+    glLoadIdentity()
+    # Map [0,WIN_W] x [0,WIN_H] to NDC, then offset to top-right quadrant
+    # We use gluPerspective + gluLookAt to fake a top-down orthographic view
+    # by placing camera very high and using a tight FOV
+    gluPerspective(2.0, 1.0, 1.0, 5000.0)
+    glMatrixMode(GL_MODELVIEW)
+    glPushMatrix()
+    glLoadIdentity()
+    # Top-down view centered at world origin
+    gluLookAt(0, 4000, 0,   0, 0, 0,   0, 0, -1)
+
+    # Scale world to fit minimap area
+    half = float(WORLD_HALF+10)
+    glScalef(1.0, 1.0, 1.0)
+
+    # Background quad
+    glColor3f(0.04,0.04,0.12)
     glBegin(GL_QUADS)
-    glVertex2f(-half,-half); glVertex2f(half,-half)
-    glVertex2f(half,half);   glVertex2f(-half,half); glEnd()
-    glColor3f(0.4,0.4,0.6); glLineWidth(2.0)
-    glBegin(GL_LINE_LOOP)
-    glVertex2f(-half,-half); glVertex2f(half,-half)
-    glVertex2f(half,half);   glVertex2f(-half,half); glEnd()
-    danger=min(1.0,(level-1)/9.0); ring_r=max(get_target_radius(),8.0)
-    glColor3f(1.0,1.0-danger*0.8,0.0); glLineWidth(2.0)
-    glBegin(GL_LINE_LOOP)
-    for s in range(32):
-        a=2*math.pi*s/32
-        glVertex2f(target_x+ring_r*math.cos(a),target_z+ring_r*math.sin(a))
+    glVertex3f(-half,0,-half); glVertex3f(half,0,-half)
+    glVertex3f(half,0,half);   glVertex3f(-half,0,half)
     glEnd()
-    glColor3f(1.0,0.5,0.0); glPointSize(10.0)
-    glBegin(GL_POINTS); glVertex2f(target_x,target_z); glEnd()
-    glColor3f(0.6,0.6,0.0); glLineWidth(1.0)
+
+    # Border
+    glColor3f(0.4,0.4,0.7)
+    glBegin(GL_LINE_LOOP)
+    glVertex3f(-half,1,-half); glVertex3f(half,1,-half)
+    glVertex3f(half,1,half);   glVertex3f(-half,1,half)
+    glEnd()
+
+    # Target
+    danger = min(1.0,(level-1)/9.0)
+    glColor3f(1.0,1.0-danger*0.8,0.0)
+    glPushMatrix(); glTranslatef(target_x,2,target_z); draw_sphere_gl(8,5,8); glPopMatrix()
+
+    # Lander
+    glColor3f(1.0,1.0,0.0)
+    glPushMatrix(); glTranslatef(lander_x,2,lander_z); draw_sphere_gl(6,5,8); glPopMatrix()
+
+    # Line to target
+    glColor3f(0.6,0.6,0.0)
     glBegin(GL_LINES)
-    glVertex2f(lander_x,lander_z); glVertex2f(target_x,target_z); glEnd()
-    hr=math.radians(rocket_heading); arrow_len=max(18.0,half*0.06)
-    glColor3f(0.0,1.0,1.0); glLineWidth(2.5)
-    glBegin(GL_LINES)
-    glVertex2f(lander_x,lander_z)
-    glVertex2f(lander_x+math.sin(hr)*arrow_len,lander_z+math.cos(hr)*arrow_len); glEnd()
-    glColor3f(1.0,1.0,0.0); glPointSize(10.0)
-    glBegin(GL_POINTS); glVertex2f(lander_x,lander_z); glEnd()
-    glPointSize(1.0); glLineWidth(1.0)
-    glEnable(GL_DEPTH_TEST)
-    glMatrixMode(GL_MODELVIEW);  glPopMatrix()
-    glMatrixMode(GL_PROJECTION); glPopMatrix()
-    glPopAttrib()
-    glViewport(0,0,WIN_W,WIN_H)
+    glVertex3f(lander_x,2,lander_z); glVertex3f(target_x,2,target_z)
+    glEnd()
+
+    glMatrixMode(GL_PROJECTION)
+    glPopMatrix()
+    glMatrixMode(GL_MODELVIEW)
+    glPopMatrix()
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  HUD
+#  HUD GAMEPLAY
 # ═══════════════════════════════════════════════════════════════════════════
 def draw_hud():
-    speed=math.sqrt(vel_x**2+vel_y**2+vel_z**2)*60
-    dtgt=math.sqrt((lander_x-target_x)**2+(lander_z-target_z)**2)
-    alt=max(0.0,lander_y-terrain_height(lander_x,lander_z))
-    lv=get_land_vel_max(); rad=get_target_radius()
-    on_oxy=(fuel<=0 and oxygen>0); both_empty=(fuel<=0 and oxygen<=0)
-    blink=abs(math.sin(animation_time*10.0))
-    _ortho_push(); glDisable(GL_DEPTH_TEST)
-    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA)
-    glColor4f(0,0,0,0.55)
-    glBegin(GL_QUADS)
-    glVertex2f(10,WIN_H-235); glVertex2f(408,WIN_H-235)
-    glVertex2f(408,WIN_H-10); glVertex2f(10,WIN_H-10); glEnd()
-    glColor4f(0,0,0,0.60)
-    glBegin(GL_QUADS)
-    glVertex2f(WIN_W-225,WIN_H-155); glVertex2f(WIN_W-10,WIN_H-155)
-    glVertex2f(WIN_W-10,WIN_H-10);   glVertex2f(WIN_W-225,WIN_H-10); glEnd()
-    glDisable(GL_BLEND)
-    fc=(1.0,0.55+0.35*blink,0.0) if on_oxy else (1.0,0.1+0.7*blink,0.1) if fuel<10 else (1.0,0.6,0.0) if fuel<30 else (0.2,0.9,0.2)
-    draw_text(20,WIN_H-30,f"FUEL:   {fuel:05.1f}%",*fc)
-    glColor3f(0.1,0.4,0.1)
-    glBegin(GL_QUADS); glVertex2f(110,WIN_H-45); glVertex2f(392,WIN_H-45); glVertex2f(392,WIN_H-32); glVertex2f(110,WIN_H-32); glEnd()
-    bw=min(fuel/100.0,1.0)*282; bc=(0.9,0.5,0.0) if on_oxy else (1.0,0.1,0.1) if fuel<10 else (1.0,0.6,0.0) if fuel<30 else (0.2,0.9,0.2)
-    glColor3f(*bc)
-    glBegin(GL_QUADS); glVertex2f(110,WIN_H-45); glVertex2f(110+bw,WIN_H-45); glVertex2f(110+bw,WIN_H-32); glVertex2f(110,WIN_H-32); glEnd()
-    oc=(1.0,0.1+0.7*blink,0.1) if oxygen<10 else (1.0,0.75,0.0) if oxygen<30 else (0.2,0.6,1.0)
-    draw_text(20,WIN_H-60,f"OXYGEN: {oxygen:05.1f}%",*oc)
-    glColor3f(0.05,0.2,0.5)
-    glBegin(GL_QUADS); glVertex2f(110,WIN_H-75); glVertex2f(392,WIN_H-75); glVertex2f(392,WIN_H-62); glVertex2f(110,WIN_H-62); glEnd()
-    ow=min(oxygen/100.0,1.0)*282; ocol=(1.0,0.1,0.1) if oxygen<10 else (1.0,0.75,0.0) if oxygen<30 else (0.2,0.6,1.0)
-    glColor3f(*ocol)
-    glBegin(GL_QUADS); glVertex2f(110,WIN_H-75); glVertex2f(110+ow,WIN_H-75); glVertex2f(110+ow,WIN_H-62); glVertex2f(110,WIN_H-62); glEnd()
-    if both_empty:   draw_text(20,WIN_H-95,"!! NO PROPELLANT - FREE FALL !!",1.0,blink*0.2,blink*0.2)
-    elif on_oxy:     draw_text(20,WIN_H-95,"!! OXYGEN BACKUP - FUEL RECHARGING !!",1.0,0.5+0.4*blink,0.0)
-    elif oxygen<15:  draw_text(20,WIN_H-95,"!! OXYGEN CRITICAL !!",1.0,blink*0.3,blink*0.3)
-    elif fuel<15:    draw_text(20,WIN_H-95,"!! FUEL LOW - OXYGEN BACKUP READY !!",1.0,0.5+0.4*blink,0.0)
-    else:            draw_text(20,WIN_H-95," ",0,0,0)
-    c2=(0.0,1.0,0.0) if speed<=lv else (1.0,0.3,0.1)
-    draw_text(20,WIN_H-115,f"SPEED:  {speed:05.2f} u/s  (safe <= {lv:.1f})",*c2)
-    ac=(0.2,1.0,0.8) if alt>5 else (1.0,0.6,0.0) if alt>2 else (1.0,0.2,0.1)
-    draw_text(20,WIN_H-135,f"ALT:    {alt:05.1f} m  (above terrain)",*ac)
-    draw_text(20,WIN_H-155,f"VEL  X:{vel_x:+.3f}  Y:{vel_y:+.3f}  Z:{vel_z:+.3f}",0.6,0.6,0.9)
-    dc=(0.0,1.0,0.5) if dtgt<rad*2 else (1.0,1.0,0.3) if dtgt<60 else (0.8,0.8,0.8)
-    draw_text(20,WIN_H-175,f"TARGET: {dtgt:05.1f} m away  PAD: {rad:.2f}m",*dc)
-    draw_text(20,WIN_H-197,"HOLD: UP=Thrust  DN=Retro  W/S=Fwd/Back  A/D=L/R Strafe",0.4,0.4,0.4)
-    draw_text(20,WIN_H-212,"      L/R ARROWS=Rotate  PgUp/Dn=Camera  All keys combinable!",0.35,0.35,0.35)
-    active=[]
-    if key_up_held():    active.append("^THRUST(OXY)" if on_oxy else "^THRUST")
-    if key_dn_held():    active.append("vRETRO")
-    if key_w_held():     active.append("FWD")
-    if key_s_held():     active.append("BACK")
-    if key_a_held():     active.append("L-STRAFE")
-    if key_d_held():     active.append("R-STRAFE")
-    if key_left_held():  active.append("ROT-L")
-    if key_right_held(): active.append("ROT-R")
+    speed = math.sqrt(vel_x**2+vel_y**2+vel_z**2)*60
+    dtgt  = math.sqrt((lander_x-target_x)**2+(lander_z-target_z)**2)
+    alt   = max(0.0, lander_y-terrain_height(lander_x,lander_z))
+    lv = get_land_vel_max(); rad = get_target_radius()
+    on_oxy = (fuel<=0 and oxygen>0); both_empty = (fuel<=0 and oxygen<=0)
+    blink = abs(math.sin(animation_time*10.0))
+
+    # Left panel
+    fc = (1.0,0.55+0.35*blink,0.0) if on_oxy else (1.0,0.1+0.7*blink,0.1) if fuel<10 else (1.0,0.6,0.0) if fuel<30 else (0.2,0.9,0.2)
+    draw_text(20, WIN_H-28,  f"FUEL:   {fuel:05.1f}%", *fc)
+    oc = (1.0,0.1+0.7*blink,0.1) if oxygen<10 else (1.0,0.75,0.0) if oxygen<30 else (0.2,0.6,1.0)
+    draw_text(20, WIN_H-48,  f"OXYGEN: {oxygen:05.1f}%", *oc)
+
+    if both_empty:  draw_text(20,WIN_H-68,"!! NO PROPELLANT - FREE FALL !!",1.0,blink*0.2,blink*0.2)
+    elif on_oxy:    draw_text(20,WIN_H-68,"!! OXYGEN BACKUP ACTIVE !!",1.0,0.5+0.4*blink,0.0)
+    elif oxygen<15: draw_text(20,WIN_H-68,"!! OXYGEN CRITICAL !!",1.0,blink*0.3,blink*0.3)
+    elif fuel<15:   draw_text(20,WIN_H-68,"!! FUEL LOW !!",1.0,0.5+0.4*blink,0.0)
+
+    c2 = (0.0,1.0,0.0) if speed<=lv else (1.0,0.3,0.1)
+    draw_text(20, WIN_H-88,  f"SPEED:  {speed:05.2f}  (safe<={lv:.1f})", *c2)
+    ac = (0.2,1.0,0.8) if alt>5 else (1.0,0.6,0.0) if alt>2 else (1.0,0.2,0.1)
+    draw_text(20, WIN_H-108, f"ALT:    {alt:05.1f} m", *ac)
+    draw_text(20, WIN_H-128, f"VEL  X:{vel_x:+.3f} Y:{vel_y:+.3f} Z:{vel_z:+.3f}", 0.6,0.6,0.9)
+    dc = (0.0,1.0,0.5) if dtgt<rad*2 else (1.0,1.0,0.3) if dtgt<60 else (0.8,0.8,0.8)
+    draw_text(20, WIN_H-148, f"TARGET: {dtgt:05.1f} m  PAD:{rad:.2f}m", *dc)
+    draw_text(20, WIN_H-168, "UP=Thrust DN=Retro WASD=Strafe LR=Rotate", 0.4,0.4,0.4)
+
+    # Active keys
+    active = []
+    if key_up_held():   active.append("^THRUST")
+    if key_dn_held():   active.append("vRETRO")
+    if key_w_held():    active.append("FWD")
+    if key_s_held():    active.append("BACK")
+    if key_a_held():    active.append("L-STRAFE")
+    if key_d_held():    active.append("R-STRAFE")
+    if key_left_held(): active.append("ROT-L")
+    if key_right_held():active.append("ROT-R")
     if active:
-        p=0.5+0.5*math.sin(animation_time*12)
-        draw_text(WIN_W//2-len(" | ".join(active))*5,WIN_H-30," | ".join(active),1.0,0.5+0.5*p,0.0)
-    danger=min(1.0,(level-1)/9.0); lc=(1.0,1.0-danger*0.8,0.0)
-    draw_text(WIN_W-215,WIN_H-30, f"SCORE:  {score}",1.0,0.9,0.1)
-    draw_text(WIN_W-215,WIN_H-55, f"LEVEL:  {level}",*lc)
-    draw_text(WIN_W-215,WIN_H-80, f"PAD R:  {rad:.2f} m",*lc)
-    draw_text(WIN_W-215,WIN_H-105,f"MAX V:  {lv:.1f} u/s",*lc)
-    draw_text(WIN_W-215,WIN_H-130,f"GRAV:   {diff_gravity():.4f}",0.6,0.5,0.8)
-    elapsed=animation_time-new_target_flash_start
-    if elapsed<5.0:
-        bf=abs(math.sin(animation_time*7)); fade2=1.0-elapsed/5.0
-        draw_text(WIN_W//2-175,WIN_H//2+60,f"** NEW TARGET! {dtgt:.0f}m AWAY **",bf*fade2,fade2,0.0)
-    draw_text(20,50,"ESC:MENU  R:RETRY  Q:FULL RESET",0.4,0.4,0.4)
+        p = 0.5+0.5*math.sin(animation_time*12)
+        draw_text(WIN_W//2-len(" | ".join(active))*5, WIN_H-28, " | ".join(active), 1.0,0.5+0.5*p,0.0)
+
+    # Right panel
+    danger = min(1.0,(level-1)/9.0); lc = (1.0,1.0-danger*0.8,0.0)
+    draw_text(WIN_W-210,WIN_H-28, f"SCORE: {score}",     1.0,0.9,0.1)
+    draw_text(WIN_W-210,WIN_H-48, f"LEVEL: {level}",     *lc)
+    draw_text(WIN_W-210,WIN_H-68, f"PAD R: {rad:.2f}m",  *lc)
+    draw_text(WIN_W-210,WIN_H-88, f"MAX V: {lv:.1f}",    *lc)
+    draw_text(WIN_W-210,WIN_H-108,f"GRAV:  {diff_gravity():.4f}", 0.6,0.5,0.8)
+
+    # New target flash
+    elapsed = animation_time - new_target_flash_start
+    if elapsed < 5.0:
+        bf = abs(math.sin(animation_time*7)); fade = 1.0-elapsed/5.0
+        draw_text(WIN_W//2-160,WIN_H//2+60,f"** NEW TARGET! {dtgt:.0f}m AWAY **",bf*fade,fade,0.0)
+
+    draw_text(20,50,"ESC:MENU  R:RETRY  Q:FULL RESET", 0.4,0.4,0.4)
+
+    # Game over overlay
     if game_over and landing_msg:
-        ok="PERFECT" in landing_msg.upper(); c3=(0.0,1.0,0.3) if ok else (1.0,0.2,0.1)
-        glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA)
-        glColor4f(0,0,0,0.78)
-        glBegin(GL_QUADS)
-        glVertex2f(WIN_W//2-335,WIN_H//2-105); glVertex2f(WIN_W//2+335,WIN_H//2-105)
-        glVertex2f(WIN_W//2+335,WIN_H//2+65);  glVertex2f(WIN_W//2-335,WIN_H//2+65); glEnd()
-        glDisable(GL_BLEND)
-        draw_text(WIN_W//2-len(landing_msg)*5,WIN_H//2+22,landing_msg,*c3)
-        draw_text(WIN_W//2-210,WIN_H//2-8,"R: RETRY (keep score)  |  Q: FULL RESET  |  ESC: MENU",0.8,0.8,0.8)
-        draw_text(WIN_W//2-120,WIN_H//2-42,f"SCORE: {score}   LEVEL: {level}",1.0,0.85,0.0)
+        ok = "PERFECT" in landing_msg.upper(); c3 = (0.0,1.0,0.3) if ok else (1.0,0.2,0.1)
+        draw_text(WIN_W//2-len(landing_msg)*5, WIN_H//2+20, landing_msg, *c3)
+        draw_text(WIN_W//2-200, WIN_H//2-10, "R:RETRY  Q:FULL RESET  ESC:MENU", 0.8,0.8,0.8)
+        draw_text(WIN_W//2-100, WIN_H//2-40, f"SCORE:{score}  LEVEL:{level}", 1.0,0.85,0.0)
+
     if not game_started and not game_over:
-        draw_text(WIN_W//2-215,WIN_H//2-30,"HOLD ARROW-UP to lift off  |  WASD + Arrows all combinable",0.9,0.9,0.2)
-    glEnable(GL_DEPTH_TEST); _ortho_pop()
+        draw_text(WIN_W//2-200,WIN_H//2-30,"HOLD ARROW-UP to lift off!", 0.9,0.9,0.2)
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  PHYSICS  — called from idle(), NOT show_screen()
+#  PHYSICS
 # ═══════════════════════════════════════════════════════════════════════════
 def update_physics():
     global lander_x,lander_y,lander_z,vel_x,vel_y,vel_z
     global fuel,oxygen,game_over,landing_msg,lander_tilt_z,lander_tilt_x
     global score,level,rocket_heading
 
-    # Continuous rotation from held arrow keys (works simultaneously with WASD)
-    if current_state=="GAMEPLAY" and not game_over:
-        if key_left_held():  rocket_heading=(rocket_heading-2.5)%360
-        if key_right_held(): rocket_heading=(rocket_heading+2.5)%360
+    if not game_over:
+        if key_left_held():  rocket_heading = (rocket_heading-2.5)%360
+        if key_right_held(): rocket_heading = (rocket_heading+2.5)%360
 
     if game_over or not game_started:
         lander_tilt_z*=0.92; lander_tilt_x*=0.92; return
@@ -677,16 +640,15 @@ def update_physics():
     G=diff_gravity(); DR=diff_drag(); TU=diff_thrust_up()
     TH=diff_thrust_horiz(); FB=diff_fuel_burn(); MX=diff_max_vel()
 
-    hr=math.radians(rocket_heading)
-    fwx=math.sin(hr); fwz=math.cos(hr)    # forward
-    rtx=math.cos(hr); rtz=-math.sin(hr)   # right
+    hr  = math.radians(rocket_heading)
+    fwx = math.sin(hr); fwz = math.cos(hr)
+    rtx = math.cos(hr); rtz = -math.sin(hr)
 
-    vel_y+=G
+    vel_y += G
     hf=fuel>0; ho=oxygen>0; oo=(not hf) and ho
     any_key=(key_up_held() or key_dn_held() or
              key_w_held() or key_s_held() or key_a_held() or key_d_held())
 
-    # ── Vertical (Arrow UP / Arrow DOWN) ─────────────────────────────────
     if key_up_held():
         if hf:   vel_y+=TU; fuel=max(0,fuel-FB)
         elif ho: vel_y+=TU*0.55; oxygen=max(0,oxygen-0.10)
@@ -694,7 +656,6 @@ def update_physics():
         if hf:   vel_y-=TU*0.45; fuel=max(0,fuel-FB*0.5)
         elif ho: vel_y-=TU*0.25; oxygen=max(0,oxygen-0.06)
 
-    # ── Horizontal (WASD) ────────────────────────────────────────────────
     any_strafe=False
     for pressed,ddx,ddz,ta,td in [
         (key_w_held(), +fwx, +fwz, 'x', -1),
@@ -746,7 +707,7 @@ def reset_game():
     global lander_x,lander_y,lander_z,vel_x,vel_y,vel_z,fuel,oxygen
     global game_started,game_over,landing_msg,gp_cam_pitch
     global lander_tilt_z,lander_tilt_x,rocket_heading
-    key_last_seen.clear()
+    _clear_keys()
     lander_x=lander_z=0.0; lander_y=terrain_height(0,0)+75.0
     vel_x=vel_y=vel_z=0.0; fuel=oxygen=100.0
     game_started=game_over=False; landing_msg=""
@@ -757,59 +718,41 @@ def full_reset():
     score=0; level=1; move_target(); reset_game()
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  DISPLAY  — NO physics here; physics lives in idle()
+#  DISPLAY
 # ═══════════════════════════════════════════════════════════════════════════
 def show_screen():
     glClearColor(0.04,0.04,0.08,1.0)
     glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT)
     glEnable(GL_DEPTH_TEST)
 
-    if current_state in ["MENU","OPTIONS"]:
-        draw_interactive_scene()
-        _ortho_push(); glDisable(GL_DEPTH_TEST)
-        active=main_menu if current_state=="MENU" else options_menu
-        for i,opt in enumerate(active): draw_button(500,500-(i*90),opt,i)
-        glEnable(GL_DEPTH_TEST); _ortho_pop()
+    if current_state == "MENU":
+        setup_menu_camera()
+        draw_menu_scene()
+        draw_menu_buttons()
 
-    elif current_state=="ROCKET_LIST":
-        _ortho_push(); glDisable(GL_DEPTH_TEST)
-        draw_text(400,650,"SELECT SPACECRAFT",1,1,1)
-        for i in range(3): draw_button(500,500-(i*100),rocket_list[i],i)
-        draw_button(500,200,"START MISSION",3); draw_button(150,50," BACK ",99)
-        if show_alert: draw_text(300,350,alert_message,1,0,0)
-        glEnable(GL_DEPTH_TEST); _ortho_pop()
+    elif current_state == "ROCKET_LIST":
+        setup_menu_camera()
+        draw_menu_scene()
+        draw_menu_buttons()
 
-    elif current_state=="ROCKET_VIEWER":
-        set_perspective(45,WIN_W/WIN_H,0.1,100.0)
-        glMatrixMode(GL_MODELVIEW); glLoadIdentity()
-        glTranslatef(0,0,-25*zoom_level)
-        glRotatef(cam_rx,1,0,0); glRotatef(cam_ry,0,1,0)
-        glTranslatef(0,-1.5,0)
+    elif current_state == "ROCKET_VIEWER":
+        setup_rocket_viewer_camera()
         if   selected_rocket_index==0: draw_jak_hound()
         elif selected_rocket_index==1: draw_eva_nation()
         elif selected_rocket_index==2: draw_jf17_thunder()
-        _ortho_push(); glDisable(GL_DEPTH_TEST)
-        draw_text(20,750,f"INSPECTING: {rocket_list[selected_rocket_index]}",1,1,0)
-        sel=(selected_rocket_for_game==selected_rocket_index)
-        if sel: draw_text(20,720,"[SELECTED]  F: reselect",0,1,0)
-        else:   draw_text(20,720,"Press F to select this rocket",0.7,0.7,0.7)
-        draw_text(20,690,"ARROWS:ROTATE | N:ZOOM IN | M:ZOOM OUT | ESC:BACK",0.5,0.5,0.5)
-        draw_button(150,50," BACK ",99)
-        glEnable(GL_DEPTH_TEST); _ortho_pop()
+        draw_text(20,WIN_H-28,f"INSPECTING: {rocket_list[selected_rocket_index]}",1,1,0)
+        sel = (selected_rocket_for_game==selected_rocket_index)
+        if sel: draw_text(20,WIN_H-50,"[SELECTED]  F: reselect",0,1,0)
+        else:   draw_text(20,WIN_H-50,"Press F to select | ARROWS:rotate | N/M:zoom | ESC:back",0.7,0.7,0.7)
 
-    elif current_state=="GAMEPLAY":
-        set_perspective(58,WIN_W/WIN_H,1.0,1800.0)
-        hr=math.radians(rocket_heading); pr=math.radians(gp_cam_pitch)
-        ecx=lander_x - math.sin(hr)*gp_cam_dist*math.cos(pr)
-        ecy=lander_y + gp_cam_dist*math.sin(pr)
-        ecz=lander_z - math.cos(hr)*gp_cam_dist*math.cos(pr)
-        set_camera(ecx,ecy,ecz, lander_x,lander_y,lander_z)
+    elif current_state == "GAMEPLAY":
+        setup_gameplay_camera()
         draw_space_background()
         draw_terrain()
         draw_target()
         draw_heading_indicator()
-        draw_new_target_arrow()
-        if not game_over: draw_trajectory()
+        if not game_over:
+            draw_trajectory()
         glPushMatrix()
         glTranslatef(lander_x,lander_y,lander_z)
         glRotatef(-rocket_heading,0,1,0)
@@ -826,125 +769,122 @@ def show_screen():
     glutSwapBuffers()
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  INPUT
+#  KEYBOARD
 # ═══════════════════════════════════════════════════════════════════════════
 def keyboard_listener(key, x, y):
     global current_state,selected_option,zoom_level
     global selected_rocket_index,selected_rocket_for_game
     global rocket_selected,show_alert,alert_message
 
-    k=key.lower() if isinstance(key,bytes) else key
+    k = key.lower() if isinstance(key,bytes) else key
 
-    if k==b'\x1b':
-        key_last_seen.clear()
+    if k == b'\x1b':
+        _clear_keys()
         if current_state=="GAMEPLAY":        current_state="MENU";        reset_game()
-        elif current_state=="OPTIONS":       current_state="MENU";        selected_option=1
-        elif current_state=="ROCKET_LIST":   current_state="OPTIONS";     selected_option=1; show_alert=False
+        elif current_state=="ROCKET_LIST":   current_state="MENU";        selected_option=1; show_alert=False
         elif current_state=="ROCKET_VIEWER": current_state="ROCKET_LIST"; selected_option=selected_rocket_index
         glutPostRedisplay(); return
 
     if current_state=="GAMEPLAY":
-        if k in (b'w',b's',b'a',b'd'): _key_press(k)   # stamps frame + sets game_started
+        if k in (b'w',b's',b'a',b'd'): _set_key(k, True)
         if k==b'r': reset_game()
         if k==b'q': full_reset()
         glutPostRedisplay(); return
 
-    if current_state in ["MENU","OPTIONS","ROCKET_LIST"]:
-        menu_items=(main_menu if current_state=="MENU"
-                    else options_menu if current_state=="OPTIONS"
-                    else rocket_list)
-        max_opt=len(menu_items)-1
-        if selected_option<0 or selected_option>max_opt: selected_option=0
+    if current_state in ["MENU","ROCKET_LIST"]:
+        items = main_menu if current_state=="MENU" else rocket_list
+        max_opt = len(items)-1
         if k in (b'\r',b' '):
             if current_state=="MENU":
-                if selected_option==0: current_state="ROCKET_LIST"; selected_option=selected_rocket_for_game
-                elif selected_option==1: current_state="OPTIONS"; selected_option=-1
+                if selected_option==0: current_state="ROCKET_LIST"; selected_option=0
+                elif selected_option==1:
+                    current_state="ROCKET_LIST"; selected_option=selected_rocket_for_game if rocket_selected else 0
                 elif selected_option==2: _os._exit(0)
-            elif current_state=="OPTIONS":
-                if selected_option==1: current_state="ROCKET_LIST"; selected_option=-1
-                elif selected_option==2: current_state="MENU"; selected_option=1
             elif current_state=="ROCKET_LIST":
-                if 0<=selected_option<3: selected_rocket_index=selected_option; current_state="ROCKET_VIEWER"
+                if 0<=selected_option<3:
+                    selected_rocket_index=selected_option; current_state="ROCKET_VIEWER"
                 elif selected_option==3:
                     if not rocket_selected: show_alert=True; alert_message="Select a spacecraft first!"
                     else: full_reset(); current_state="GAMEPLAY"
 
     if current_state=="ROCKET_VIEWER":
-        if k==b'n': zoom_level=max(0.2,zoom_level-0.1)
+        if k==b'n': zoom_level=max(0.3,zoom_level-0.1)
         elif k==b'm': zoom_level=min(3.0,zoom_level+0.1)
         elif k==b'f': selected_rocket_for_game=selected_rocket_index; rocket_selected=True
     glutPostRedisplay()
+
+def keyboard_up_listener(key, x, y):
+    k = key.lower() if isinstance(key,bytes) else key
+    if current_state=="GAMEPLAY" and k in (b'w',b's',b'a',b'd'):
+        _set_key(k, False)
 
 def special_key_listener(key, x, y):
     global cam_rx,cam_ry,selected_option,gp_cam_pitch
 
     if current_state=="GAMEPLAY":
-        # Thrust keys — stamp for frame-based hold detection
-        if   key==GLUT_KEY_UP:        _key_press(b'\x00up')   # also sets game_started
-        elif key==GLUT_KEY_DOWN:      _key_press(b'\x00dn')
-        # Rotation keys — stamp for smooth continuous rotation in update_physics()
-        elif key==GLUT_KEY_LEFT:      _key_press(b'\x00lt')
-        elif key==GLUT_KEY_RIGHT:     _key_press(b'\x00rt')
+        if   key==GLUT_KEY_UP:        _set_key(b'\x00up', True)
+        elif key==GLUT_KEY_DOWN:      _set_key(b'\x00dn', True)
+        elif key==GLUT_KEY_LEFT:      _set_key(b'\x00lt', True)
+        elif key==GLUT_KEY_RIGHT:     _set_key(b'\x00rt', True)
         elif key==GLUT_KEY_PAGE_UP:   gp_cam_pitch=min(80,gp_cam_pitch+3)
-        elif key==GLUT_KEY_PAGE_DOWN: gp_cam_pitch=max(5, gp_cam_pitch-3)
+        elif key==GLUT_KEY_PAGE_DOWN: gp_cam_pitch=max(5,gp_cam_pitch-3)
 
     elif current_state=="ROCKET_VIEWER":
         if   key==GLUT_KEY_LEFT:  cam_ry-=5
         elif key==GLUT_KEY_RIGHT: cam_ry+=5
-        elif key==GLUT_KEY_UP:    cam_rx-=5
-        elif key==GLUT_KEY_DOWN:  cam_rx+=5
+        elif key==GLUT_KEY_UP:    cam_rx=min(80,cam_rx+5)
+        elif key==GLUT_KEY_DOWN:  cam_rx=max(-80,cam_rx-5)
 
-    elif current_state in ["MENU","OPTIONS","ROCKET_LIST"]:
-        menu_items=(main_menu if current_state=="MENU"
-                    else options_menu if current_state=="OPTIONS"
-                    else rocket_list)
-        max_opt=len(menu_items)-1
-        if selected_option<0: selected_option=0
+    elif current_state in ["MENU","ROCKET_LIST"]:
+        items = main_menu if current_state=="MENU" else rocket_list
+        max_opt = len(items)-1
+        if selected_option < 0: selected_option=0
         if   key==GLUT_KEY_UP:   selected_option=max(0,selected_option-1)
         elif key==GLUT_KEY_DOWN: selected_option=min(max_opt,selected_option+1)
     glutPostRedisplay()
 
-def mouse_listener(button,state,x,y):
+def special_up_listener(key, x, y):
+    if current_state=="GAMEPLAY":
+        if   key==GLUT_KEY_UP:    _set_key(b'\x00up', False)
+        elif key==GLUT_KEY_DOWN:  _set_key(b'\x00dn', False)
+        elif key==GLUT_KEY_LEFT:  _set_key(b'\x00lt', False)
+        elif key==GLUT_KEY_RIGHT: _set_key(b'\x00rt', False)
+
+def mouse_listener(button, state, x, y):
     global current_state,selected_option,selected_rocket_index
     global last_click_x,last_click_y,rocket_selected,show_alert,alert_message
 
     if button==GLUT_LEFT_BUTTON and state==GLUT_DOWN:
         last_click_x,last_click_y=x,y; ly=WIN_H-y
-        if current_state=="ROCKET_LIST":
-            for i in range(3):
-                if 400<=x<=600 and (500-(i*100)-10)<=ly<=(500-(i*100)+25):
-                    selected_rocket_index=i; current_state="ROCKET_VIEWER"
-            if 400<=x<=600 and 190<=ly<=225:
-                if not rocket_selected: show_alert=True; alert_message="Select a spacecraft first!"
-                else: full_reset(); current_state="GAMEPLAY"
-            if x<=250 and ly<=100: current_state="OPTIONS"; selected_option=1
-        elif current_state=="ROCKET_VIEWER":
-            if x<=250 and ly<=100: current_state="ROCKET_LIST"
-        else:
-            active=main_menu if current_state=="MENU" else options_menu
-            for i in range(len(active)):
-                if 400<=x<=600 and (500-(i*90)-10)<=ly<=(500-(i*90)+25):
+        if current_state in ["MENU","ROCKET_LIST"]:
+            items = main_menu if current_state=="MENU" else rocket_list
+            for i,label in enumerate(items):
+                cy = 500 - i*80
+                if abs(ly - cy) < 20:
                     if selected_option==i:
                         if current_state=="MENU":
-                            if i==0: current_state="ROCKET_LIST"; selected_option=selected_rocket_for_game
-                            elif i==1: current_state="OPTIONS"; selected_option=-1
+                            if i==0: current_state="ROCKET_LIST"; selected_option=0
+                            elif i==1: current_state="ROCKET_LIST"; selected_option=selected_rocket_for_game if rocket_selected else 0
                             elif i==2: _os._exit(0)
-                        elif current_state=="OPTIONS":
-                            if i==1: current_state="ROCKET_LIST"; selected_option=-1
-                            elif i==2: current_state="MENU"; selected_option=1
+                        elif current_state=="ROCKET_LIST":
+                            if 0<=i<3: selected_rocket_index=i; current_state="ROCKET_VIEWER"
+                            elif i==3:
+                                if not rocket_selected: show_alert=True; alert_message="Select a spacecraft first!"
+                                else: full_reset(); current_state="GAMEPLAY"
                     else: selected_option=i
+        elif current_state=="ROCKET_VIEWER":
+            if ly < 80: current_state="ROCKET_LIST"
     glutPostRedisplay()
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  IDLE  — physics runs here every tick, completely decoupled from rendering
+#  IDLE
 # ═══════════════════════════════════════════════════════════════════════════
 def idle():
-    global animation_time,planet_rotation_y,frame_count
-    frame_count+=1
-    animation_time+=0.01
-    planet_rotation_y+=0.015
+    global animation_time, planet_rotation_y
+    animation_time += 0.01
+    planet_rotation_y += 0.015
     if current_state=="GAMEPLAY":
-        update_physics()        # ← physics here, not in show_screen
+        update_physics()
     glutPostRedisplay()
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -952,18 +892,25 @@ def idle():
 # ═══════════════════════════════════════════════════════════════════════════
 def main():
     glutInit()
-    glutInitDisplayMode(GLUT_DOUBLE|GLUT_RGB|GLUT_DEPTH)
-    glutInitWindowSize(WIN_W,WIN_H)
-    glutInitWindowPosition(0,0)
+    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB | GLUT_DEPTH)
+    glutInitWindowSize(1000, 800)
+    glutInitWindowPosition(0, 0)
     glutCreateWindow(b"Lunar Descent")
+
+    glEnable(GL_DEPTH_TEST)
+
     glutDisplayFunc(show_screen)
     glutKeyboardFunc(keyboard_listener)
+    glutKeyboardUpFunc(keyboard_up_listener)
     glutSpecialFunc(special_key_listener)
+    glutSpecialUpFunc(special_up_listener)
     glutMouseFunc(mouse_listener)
     glutIdleFunc(idle)
+    glutIgnoreKeyRepeat(1)
+
     move_target()
     reset_game()
     glutMainLoop()
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
